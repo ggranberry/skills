@@ -1,6 +1,6 @@
 ---
 name: parse-migrations
-description: Parse migration files and model definitions to extract database schema as JSON. Expects ORM type to be known (run detect-orm first).
+description: Parse migration files and model definitions to extract database schema as JSON. Use when extracting schema constraints for CrossHair stubs. Expects ORM type to be known (run detect-orm first). Not for writing or running migrations.
 ---
 
 # Parse Migrations

@@ -1,6 +1,6 @@
 ---
 name: detect-orm
-description: Detect which ORM framework(s) a Python project uses. Use when analyzing a new codebase or before making database-related changes.
+description: Detect which ORM framework(s) a Python project uses. Use when asked to identify the ORM, find model files, or before running CrossHair/generate-stubs. Not for answering general database questions or writing queries.
 ---
 
 # Detect ORM
