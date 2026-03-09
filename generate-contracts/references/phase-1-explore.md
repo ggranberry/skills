@@ -1,63 +1,76 @@
 # Phase 1: Explore — Discover Contract Candidates
 
-Spawn as: `Task(subagent_type="Explore")`
+Discover all functions/methods that could receive contracts. This phase has two steps: first verify which packages to scan, then run the explore script.
 
-Perform a broad, mechanical sweep of the project to produce a manifest of all functions and methods that could potentially receive contracts. Do NOT judge whether a function is "contract-worthy" — that decision belongs to the Planner in Phase 2.
+## Step 1: Verify Source Packages
 
-## Discovery Strategy
+Before running the script, determine the correct source packages to scan.
 
-### Step 1: Find the source root
+1. **List the top-level directories** in the project root:
+   ```bash
+   ls -d */
+   ```
 
-Read `.claude/artifacts/crosshair-bugs/orm-detection.json` to get the list of model files. Determine the project's source root: the top-level package directory that contains the model files. For example, if model files are at `mealie/db/models/recipe/recipe.py`, the source root is `mealie/`.
+2. **Read `orm-detection.json`** (if it exists) to see which packages contain models:
+   ```bash
+   cat .claude/artifacts/crosshair-bugs/orm-detection.json
+   ```
 
-### Step 2: Scan for Python files
+3. **Classify each directory.** For every top-level directory, decide if it's:
+   - **Source package** — contains the project's business logic, models, views, services, etc.
+   - **Infrastructure** — project config (e.g., Django `settings.py`), deployment scripts, tooling, docs
+   - **Excluded by default** — tests, migrations, node_modules, .venv, etc. (the script handles these)
 
-Starting from the source root, find all `.py` files that contain function or method definitions (`def `). Include sibling directories at the same level if they appear to be part of the same project (share the same parent, contain `__init__.py`).
+   Look at what's inside ambiguous directories before deciding — a directory named `core/` might be business logic or might be framework wiring. Check for `__init__.py` and skim a few `.py` files if unclear.
 
-### Step 3: Apply mechanical exclusions
+4. **Identify project-specific subdirectory exclusions.** Some source packages contain subdirectories that shouldn't be scanned (management commands, data import scripts, API schema examples, fixture generators, etc.). List these for `--exclude-dirs`.
 
-Read `.claude/skills/generate-contracts/references/exclusions.md` and apply all exclusion rules. These are purely mechanical — directory exclusions, file exclusions, trivial-body exclusions, etc.
+## Step 2: Run the Explore Script
 
-**Key principle:** When in doubt, INCLUDE. The Planner filters in Phase 2.
+Run with the verified packages and exclusions:
 
-### Step 4: Extract function metadata
+```bash
+python .claude/skills/generate-contracts/scripts/explore-contracts.py \
+  --packages <package1> <package2> ... \
+  --exclude-dirs <dir1> <dir2> ... \
+  --output .claude/artifacts/crosshair-bugs/contract-targets.json
+```
 
-For each non-excluded Python file, extract every non-excluded function and method definition:
+If you're confident the auto-detection will get it right (small project, obvious package structure), you can omit `--packages` and let the script auto-detect, then verify the `source_packages` field in the output matches your expectations.
 
-- **name**: Qualified name (`ClassName.method_name` for methods, `function_name` for top-level)
-- **signature**: Parameter list as written in source
-- **line_number**: Line where `def` appears
-- **line_count**: Number of lines in the function body (from `def` to the last line before the next definition or dedent)
-- **has_existing_docstring**: Whether the function already has a docstring
+### Auto-Detection (when --packages is omitted)
 
-Do NOT include full source code. The manifest must be lightweight.
+The script auto-detects source packages by:
+1. Scanning for top-level directories with `__init__.py`
+2. Supplementing with packages found in `orm-detection.json`
+3. Filtering out common non-source directories (scripts, tools, docs, deploy, etc.)
+
+## Step 3: Verify the Output
+
+After running, check the summary output. If a package was missed or an unwanted one was included, re-run with explicit `--packages`.
+
+The script always excludes standard non-source directories (tests, migrations, __pycache__, node_modules, .venv, etc.) — see the script's `DEFAULT_EXCLUDED_DIRS` for the full list.
 
 ## Output Format
 
-Write to `.claude/artifacts/crosshair-bugs/contract-targets.json`:
+Written to `.claude/artifacts/crosshair-bugs/contract-targets.json`:
 
 ```json
 {
-  "source_root": "mealie/",
+  "source_packages": ["myapp", "core", "utils"],
   "total_files_scanned": 142,
   "total_functions_found": 387,
   "total_functions_excluded": 203,
+  "total_functions_included": 184,
   "files": [
     {
-      "path": "mealie/repos/repository_foods.py",
+      "path": "myapp/repos/repository_foods.py",
       "functions": [
         {
           "name": "RepositoryFood.merge",
           "signature": "(self, from_food: UUID4, to_food: UUID4)",
           "line_number": 45,
           "line_count": 22,
-          "has_existing_docstring": false
-        },
-        {
-          "name": "RepositoryFood.by_group",
-          "signature": "(self, group_id: UUID4, search: str | None = None)",
-          "line_number": 70,
-          "line_count": 8,
           "has_existing_docstring": false
         }
       ]
@@ -66,4 +79,4 @@ Write to `.claude/artifacts/crosshair-bugs/contract-targets.json`:
 }
 ```
 
-**Summary counts** at the top level let the orchestrator estimate batching without parsing all entries.
+Summary counts at the top level let the orchestrator estimate batching without parsing all entries.

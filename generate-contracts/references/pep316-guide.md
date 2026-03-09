@@ -2,6 +2,22 @@
 
 Reference material for writing PEP 316 docstring contracts for CrossHair symbolic analysis.
 
+## Contents
+
+- [Syntax Reference](#syntax-reference)
+  - [Preconditions](#preconditions)
+  - [Postconditions](#postconditions)
+  - [Class Invariants](#class-invariants)
+  - [Multi-line conditions](#multi-line-conditions)
+- [Assertions in Function Bodies](#assertions-in-function-bodies)
+- [Best Practices](#best-practices)
+  - [What makes a good precondition](#what-makes-a-good-precondition)
+  - [What makes a good postcondition](#what-makes-a-good-postcondition)
+  - [What makes a good invariant](#what-makes-a-good-invariant)
+  - [Contract strength: finding the sweet spot](#contract-strength-finding-the-sweet-spot)
+  - [Docstring integration](#docstring-integration)
+  - [Common contract patterns](#common-contract-patterns)
+
 ## Syntax Reference
 
 ### Preconditions

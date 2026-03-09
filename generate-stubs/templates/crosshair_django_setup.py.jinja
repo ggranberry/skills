@@ -1,0 +1,63 @@
+"""
+CrossHair plugin: minimal Django registry patch.
+
+Replaces full django.setup() with only the minimum state needed to import
+Django model files. Avoids loading all installed apps, running AppConfig.ready()
+hooks, or touching the database.
+
+Root cause: ModelBase.__new__ calls apps.get_containing_app_config() for every
+concrete model class. That requires apps.apps_ready=True and must not return None
+(or the model needs an explicit app_label in Meta).
+
+Secondary: get_user_model() calls apps.get_model('auth', 'User', require_ready=False)
+which needs get_app_config('auth') to succeed even with an empty app_configs registry.
+
+Implementation note: CrossHair exec()s this file inside main() without a custom
+namespace. Class bodies defined in that exec context cannot see exec-local names
+(Python 3 class-body scoping limitation). All stub classes are therefore kept in
+_crosshair_registry_patch.py (a real importable module) and imported here.
+"""
+import os
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "{{ django_settings_module }}")
+
+# Import stubs from a real module — must happen before any Django imports
+# so that get_containing_app_config and get_app_config can be patched first.
+from _crosshair_registry_patch import _RegistryStubAppConfig
+
+from django.apps import apps as _apps
+
+
+def _patched_get_containing_app_config(self, object_name,
+                                       _Stub=_RegistryStubAppConfig):
+    """Return stub AppConfig for any module not registered in app_configs."""
+    self.check_apps_ready()
+    for app_config in self.app_configs.values():
+        if object_name.startswith(app_config.name):
+            subpath = object_name.removeprefix(app_config.name)
+            if subpath == "" or subpath[0] == ".":
+                return app_config
+    # Derive label from the second-to-last dotted component
+    parts = object_name.split(".")
+    label = parts[-2] if len(parts) >= 2 else parts[0]
+    name = ".".join(parts[:-1]) if len(parts) >= 2 else parts[0]
+    return _Stub(label, name)
+
+
+def _patched_get_app_config(self, app_label, _Stub=_RegistryStubAppConfig):
+    """Return stub AppConfig instead of raising LookupError for unknown labels."""
+    self.check_apps_ready()
+    try:
+        return self.app_configs[app_label]
+    except KeyError:
+        return _Stub(app_label)
+
+
+# Patch the class so all instances (including the global singleton) use it
+_apps.__class__.get_containing_app_config = _patched_get_containing_app_config
+_apps.__class__.get_app_config = _patched_get_app_config
+
+# Mark the registry as ready — this is the only flag check_apps_ready() checks
+_apps.apps_ready = True
+_apps.models_ready = True
+_apps.ready = True

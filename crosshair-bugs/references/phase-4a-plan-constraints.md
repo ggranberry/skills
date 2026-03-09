@@ -20,7 +20,7 @@ For each constraint type, plan the translation:
 
 ## Output
 
-Write to `.claude/artifacts/crosshair-bugs/constraint-plan.md`:
+Write to `.claude/artifacts/crosshair-bugs/plans/constraint-plan.md`:
 
 ```markdown
 # Constraint Application Plan

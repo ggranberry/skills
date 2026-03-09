@@ -6,7 +6,7 @@ Implement constraint application based on the plan.
 
 ## Instructions
 
-1. Read `.claude/artifacts/crosshair-bugs/constraint-plan.md`
+1. Read `.claude/artifacts/crosshair-bugs/plans/constraint-plan.md`
 2. Read `_crosshair_stubs.py`
 3. Add required imports from plan
 4. Implement `_apply_constraints()` function per the plan

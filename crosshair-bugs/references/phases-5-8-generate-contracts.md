@@ -1,30 +1,6 @@
----
-name: generate-contracts
-description: Add PEP 316 docstring contracts (preconditions, postconditions, invariants) to business logic functions for CrossHair symbolic analysis. Use when asked to add contracts, prepare for CrossHair, or annotate functions with pre/post conditions. Not for general code documentation or type annotations.
----
-
-# Generate Contracts
+# Phases 5–8: Generate Contracts
 
 Adds PEP 316 docstring contracts to business logic classes and functions so CrossHair can verify them symbolically against database stubs.
-
-## Purpose
-
-CrossHair stubs replace DB calls with symbolic values, but without contracts there is nothing to *check*. Contracts define what "correct" means:
-
-- **Preconditions** (`pre:`) declare what must be true for a function to work correctly
-- **Postconditions** (`post:`) declare what the function guarantees when it returns
-- **Invariants** (`inv:`) declare what must always be true about an object's state
-
-CrossHair searches for inputs that satisfy preconditions but violate postconditions or invariants — those are bugs.
-
-No library dependency is needed. PEP 316 contracts are pure docstrings that CrossHair reads natively.
-
-## Prerequisites
-
-Before running this skill:
-- `orm-detection.json` must exist (from detect-orm)
-- `schema-constraints.json` must exist (from parse-migrations)
-- `_crosshair_stubs.py` should exist (from generate-stubs), though contracts can be planned without it
 
 ## Context Isolation
 
@@ -32,17 +8,17 @@ Each phase runs as a separate agent with its own context:
 
 | Phase | Reads | Does NOT read |
 |-------|-------|---------------|
-| Phase 1 (Explore) | orm-detection.json, source files (via explore-contracts.py script) | schema-constraints.json, pep316-guide.md |
-| Phase 1.5 (Chunk) | contract-targets.json | Everything else — just a Python script |
-| Phase 2 (Plan) | planner-assignments.json (its assignment), schema-constraints.json, pep316-guide.md, **one source file**. Writes plan to `contract-plan-*.md`. | exclusions.md (already applied in Phase 1) |
-| Phase 3 (Apply) | contract-plan-*.md, source files (to edit) | contract-targets.json, schema-constraints.json |
-| Phase 4 (Validate) | Modified source files (via CrossHair CLI) | Everything else — this is just a bash command |
+| Phase 5 (Explore) | orm-detection.json, source files (via explore-contracts.py script) | schema-constraints.json, pep316-guide.md |
+| Phase 5.5 (Chunk) | contract-targets.json | Everything else — just a Python script |
+| Phase 6 (Plan) | planner-assignments.json (its assignment), schema-constraints.json, pep316-guide.md, **one source file**. Writes plan to `contract-plan-*.md`. | exclusions.md (already applied in Phase 5) |
+| Phase 7 (Apply) | contract-plan-*.md, source files (to edit) | contract-targets.json, schema-constraints.json |
+| Phase 8 (Validate) | Modified source files (via CrossHair CLI) | Everything else — this is just a bash command |
 
-**Phase 1 outputs a lightweight manifest** (file paths, function names, signatures, line counts) — no embedded source. **Phase 1.5 splits the manifest into per-file assignments.** **Phase 2 reads one source file per agent**, giving full attention to every function. Phase 2 is the **only** phase that reads the PEP 316 guide.
+**Phase 5 outputs a lightweight manifest** (file paths, function names, signatures, line counts) — no embedded source. **Phase 5.5 splits the manifest into per-file assignments.** **Phase 6 reads one source file per agent**, giving full attention to every function. Phase 6 is the **only** phase that reads the PEP 316 guide.
 
-## Workflow
+---
 
-### Phase 1: Explore (Discover Contract Candidates)
+## Phase 5: Explore (Discover Contract Candidates)
 
 Discover all functions that could receive contracts. First verify which top-level packages are source code vs. infrastructure by listing directories and checking `orm-detection.json`, then run the explore script with the correct `--packages` and `--exclude-dirs`.
 
@@ -55,9 +31,11 @@ python .claude/skills/generate-contracts/scripts/explore-contracts.py \
 
 Read and follow `.claude/skills/generate-contracts/references/phase-1-explore.md` for the full verification + run workflow.
 
-### Phase 1.5: Chunk Targets into Planner Assignments
+---
 
-Run the chunking script to split the Phase 1 manifest into per-file planner assignments. Each assignment scopes a single planner to one file (or one chunk of a large file).
+## Phase 5.5: Chunk Targets into Planner Assignments
+
+Run the chunking script to split the Phase 5 manifest into per-file planner assignments. Each assignment scopes a single planner to one file (or one chunk of a large file).
 
 ```bash
 python .claude/skills/generate-contracts/scripts/chunk-targets.py \
@@ -88,16 +66,19 @@ The script outputs `planner-assignments.json`:
 }
 ```
 
-### Phase 2: Plan Contracts (One Planner Per File — Batched)
+---
+
+## Phase 6: Plan Contracts (One Planner Per File — Batched)
 
 There are typically hundreds of assignments. Each session processes a **batch**; progress is tracked automatically by checking which `contract-plan-*.md` files exist on disk.
 
 1. **Get the next batch:**
    ```bash
    python .claude/skills/generate-contracts/scripts/batch-progress.py \
-     --batch-size 10
+     --batch-size 10 \
+     --artifacts-dir .claude/artifacts/crosshair-bugs/plans/
    ```
-   The script prints a progress summary to stderr and outputs the next batch of assignments as JSON to stdout. If the batch is empty, all assignments are planned — move to Phase 3.
+   The script prints a progress summary to stderr and outputs the next batch of assignments as JSON to stdout. If the batch is empty, all assignments are planned — move to Phase 7.
 
 2. **Spawn planner agents** for every assignment in the batch, in parallel. Each agent focuses on **one file** (or one chunk of a large file) and produces its own plan file.
 
@@ -107,17 +88,21 @@ The planner first triages each function as CONTRACT or SKIP (with reason), then 
 
 **This is the only phase that reads the PEP 316 guide** at `.claude/skills/generate-contracts/references/pep316-guide.md`.
 
+**If the ORM is Django**, each planner agent must also read `.claude/skills/crosshair-django/references/precondition-patterns.md` alongside the PEP 316 guide. These patterns prevent the most common symbolic noise false positives in Django/DRF code: incorrect type guards for model instances, querysets, requests, and DRF views/fields; `isdigit()` vs `isdecimal()` for string-to-int coercions; and Unicode-unsafe string length postconditions.
+
 Read and follow the prompt in `.claude/skills/generate-contracts/references/phase-2-plan.md`.
 
-Each planner writes output to `.claude/artifacts/crosshair-bugs/<output_file>` (from its assignment).
+Each planner writes output to `.claude/artifacts/crosshair-bugs/plans/<output_file>` (from its assignment).
 
 > **Do NOT skip assignments or cherry-pick "high-value" files.** The batch script decides ordering. Process every assignment it returns.
 
-### Phase 3: Apply Contracts (Parallel by Source File)
+---
+
+## Phase 7: Apply Contracts (Parallel by Source File)
 
 Spawn one apply agent per unique source file — all in parallel in a single message. Grouping by source file prevents write conflicts when a large file was chunked into multiple plan files.
 
-1. **Find pending work:** Read `planner-assignments.json`. For each assignment, check if its `output_file` exists under `.claude/artifacts/crosshair-bugs/` and does NOT end with `## Applied`. Those are pending.
+1. **Find pending work:** Read `planner-assignments.json`. For each assignment, check if its `output_file` exists under `.claude/artifacts/crosshair-bugs/plans/` and does NOT end with `## Applied`. Those are pending.
 
 2. **Group by source file:** Collect all pending assignments and group them by `file`. Each group becomes one apply-agent's work.
 
@@ -127,7 +112,9 @@ Spawn one apply agent per unique source file — all in parallel in a single mes
 
 Read and follow the prompt in `.claude/skills/generate-contracts/references/phase-3-apply.md`.
 
-### Phase 4: Validate Contract Syntax
+---
+
+## Phase 8: Validate Contract Syntax
 
 Quick smoke test to confirm CrossHair can find and parse the contracts. This is NOT a bug-finding run — just a syntax check.
 
@@ -138,23 +125,18 @@ crosshair check <file> \
   2>&1
 ```
 
-Run this on each file modified in Phase 3. Timeouts and "no violation found" are both fine — they mean the contract was parsed successfully.
+Run this on each file modified in Phase 7. Timeouts and "no violation found" are both fine — they mean the contract was parsed successfully.
 
-## Output
+---
 
-- `.claude/artifacts/crosshair-bugs/contract-targets.json` — discovered candidates (lightweight manifest)
-- `.claude/artifacts/crosshair-bugs/planner-assignments.json` — per-file planner scoping
-- `.claude/artifacts/crosshair-bugs/contract-plan-*.md` — per-file triage decisions + planned contracts
-- Modified source files with PEP 316 docstring contracts
-
-## Resuming
+## Resuming Phases 5–8
 
 Progress is tracked by **file existence** — no separate state file needed:
 
-- **Phase 2:** `batch-progress.py` diffs `planner-assignments.json` against existing `contract-plan-*.md` files. Assignments whose plan file already exists are skipped automatically.
-- **Phase 3:** Plan files without a `## Applied` section at the end are pending. Already-applied plans are skipped.
+- **Phase 6:** `batch-progress.py` diffs `planner-assignments.json` against existing `contract-plan-*.md` files. Assignments whose plan file already exists are skipped automatically.
+- **Phase 7:** Plan files without a `## Applied` section at the end are pending. Already-applied plans are skipped.
 
 Artifact dependencies:
-- Phase 1.5+ can read `contract-targets.json`
-- Phase 2+ can read `planner-assignments.json`
-- Phase 3 can read `contract-plan-*.md`
+- Phase 5.5+ can read `contract-targets.json`
+- Phase 6+ can read `planner-assignments.json`
+- Phase 7 can read `contract-plan-*.md`
