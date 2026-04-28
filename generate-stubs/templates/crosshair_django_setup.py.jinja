@@ -1,25 +1,43 @@
 """
-CrossHair plugin: minimal Django registry patch.
+CrossHair plugin: Django setup for symbolic execution.
 
-Replaces full django.setup() with only the minimum state needed to import
-Django model files. Avoids loading all installed apps, running AppConfig.ready()
-hooks, or touching the database.
+Three layers:
 
-Root cause: ModelBase.__new__ calls apps.get_containing_app_config() for every
-concrete model class. That requires apps.apps_ready=True and must not return None
-(or the model needs an explicit app_label in Meta).
+1. **Registry stubs** — patch ``django.apps.apps`` so model classes can be
+   imported without ``django.setup()`` (no app loading, no DB).
 
-Secondary: get_user_model() calls apps.get_model('auth', 'User', require_ready=False)
-which needs get_app_config('auth') to succeed even with an empty app_configs registry.
+2. **Symbolic-instance patches** — replace ``Model.__init__``, ``UUID.__init__``,
+   ``forms.Field.__init__``, and ``BaseForm.__init__`` so user code that
+   directly instantiates these classes (or accepts them as parameters)
+   gets *constrained symbolic* values rather than concrete defaults.
+   Without this, contracts like ``pre: "|" in self.channel.value`` would
+   be unsatisfiable and every path returns UNKNOWN.
 
-Implementation note: CrossHair exec()s this file inside main() without a custom
-namespace. Class bodies defined in that exec context cannot see exec-local names
-(Python 3 class-body scoping limitation). All stub classes are therefore kept in
-_crosshair_registry_patch.py (a real importable module) and imported here.
+3. **Forward-reference resolution** — wrap ``typing.get_type_hints`` so
+   recursive type aliases declared in ``{{ typealias_module }}``
+   (typically ``JSONValue``/``JSONDict``-style) resolve from any
+   importing module's namespace, not just the alias module's own.
+
+Implementation notes:
+
+- CrossHair ``exec()``s this file inside ``main()`` without a custom
+  namespace. *Class bodies* AND *function bodies* defined in that exec
+  context cannot reliably see exec-local names (Python 3 scoping
+  limitation — class-body name resolution is documented; function-body
+  closures over exec-locals also fail at call time, observed in practice).
+  Mitigation: stub classes live in ``_crosshair_registry_patch.py``
+  (a real importable module); patched ``__init__`` functions re-import
+  what they need inside the function body; closures bind via default
+  args.
+- Set ``CH_DJANGO_DEBUG=1`` to print plugin diagnostics to stderr.
 """
 import os
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "{{ django_settings_module }}")
+
+# ---------------------------------------------------------------------------
+# Layer 1: Registry stubs (allows model files to import without django.setup())
+# ---------------------------------------------------------------------------
 
 # Import stubs from a real module — must happen before any Django imports
 # so that get_containing_app_config and get_app_config can be patched first.
@@ -37,7 +55,6 @@ def _patched_get_containing_app_config(self, object_name,
             subpath = object_name.removeprefix(app_config.name)
             if subpath == "" or subpath[0] == ".":
                 return app_config
-    # Derive label from the second-to-last dotted component
     parts = object_name.split(".")
     label = parts[-2] if len(parts) >= 2 else parts[0]
     name = ".".join(parts[:-1]) if len(parts) >= 2 else parts[0]
@@ -53,11 +70,362 @@ def _patched_get_app_config(self, app_label, _Stub=_RegistryStubAppConfig):
         return _Stub(app_label)
 
 
-# Patch the class so all instances (including the global singleton) use it
 _apps.__class__.get_containing_app_config = _patched_get_containing_app_config
 _apps.__class__.get_app_config = _patched_get_app_config
-
-# Mark the registry as ready — this is the only flag check_apps_ready() checks
 _apps.apps_ready = True
 _apps.models_ready = True
 _apps.ready = True
+
+
+# ---------------------------------------------------------------------------
+# Layer 2a: Symbolic Model.__init__
+# ---------------------------------------------------------------------------
+#
+# Django's Model.__init__ ends each kwarg pass with
+#   ``setattr(self, field.attname, val)``,
+# which routes through related-field descriptors. Those descriptors do
+# ``cached != value`` on the symbolic int passed by CrossHair, but that
+# comparison runs outside CrossHair's tracing region and trips:
+#   ``CrossHairInternal: Numeric operation on symbolic while not tracing``.
+#
+# Replacement: write field values straight into ``self.__dict__``,
+# skipping the descriptor chain. Values are *symbolic* when CrossHair is
+# tracing (so contracts on ``self.<field>`` actually exercise paths) and
+# concrete-empty otherwise (so the patch is safe for any imports the
+# plugin triggers). ForeignKey targets are populated into
+# ``_state.fields_cache`` so the forward descriptor returns them directly
+# without a DB query.
+from django.db.models.base import Model as _Model
+
+# Map Django Field internal types to a Python type CrossHair can proxy.
+# Only fields that map here get symbolic values; relations / generated /
+# JSON / file-blob fields fall through to a sane concrete default.
+_DJANGO_FIELD_TO_PY: dict = {
+    "CharField": str, "TextField": str, "SlugField": str,
+    "EmailField": str, "URLField": str,
+    "GenericIPAddressField": str, "IPAddressField": str,
+    "FilePathField": str,
+    "IntegerField": int, "BigIntegerField": int, "SmallIntegerField": int,
+    "PositiveIntegerField": int, "PositiveSmallIntegerField": int,
+    "PositiveBigIntegerField": int,
+    "AutoField": int, "BigAutoField": int, "SmallAutoField": int,
+    "BooleanField": bool, "NullBooleanField": bool,
+    "FloatField": float,
+    "BinaryField": bytes,
+}
+
+# Thread-local recursion guard so FK descriptor proxies don't blow the
+# stack on cyclic schemas (Profile → Project → User → Profile → ...).
+import threading as _threading
+_init_state = _threading.local()
+
+
+def _patched_model_init(self, *args, **kwargs):
+    # Re-import inside the function body — the plugin's exec scope tears
+    # down after CrossHair finishes loading it, so module-level closures
+    # over exec-locals don't survive.
+    from django.db.models.base import ModelState
+    self.__dict__["_state"] = ModelState()
+    opts = self._meta
+    fields = list(opts.concrete_fields)
+
+    # Try to upgrade default values to symbolic ones when CrossHair is
+    # actively tracing. CrossHair's context_statespace() raises
+    # CrossHairInternal (a BaseException, not Exception!) when there's
+    # no statespace — catch BaseException so non-tracing imports
+    # (django.setup-time class init, etc.) fall through cleanly.
+    space = None
+    proxy_for_type = None
+    try:
+        from crosshair.statespace import context_statespace
+        from crosshair.core_and_libs import proxy_for_type as _pft
+        space = context_statespace()
+        proxy_for_type = _pft
+    except BaseException:  # noqa: BLE001
+        pass
+
+    cls_name = type(self).__name__
+    depth = getattr(_init_state, "depth", 0)
+    _init_state.depth = depth + 1
+
+    try:
+        def _initial_value_for(f):
+            # 1. If the field has an explicit default, honour it.
+            if f.has_default():
+                d = f.default
+                return d() if callable(d) else d
+            # 2. Try a symbolic value if we're inside CrossHair tracing
+            #    AND the field maps to a known Python type.
+            if space is not None and proxy_for_type is not None:
+                py_type = _DJANGO_FIELD_TO_PY.get(type(f).__name__)
+                if py_type is not None:
+                    varname = f"{cls_name}_{f.attname}"
+                    try:
+                        return proxy_for_type(py_type, varname)
+                    except BaseException:  # noqa: BLE001
+                        pass
+            # 3. Mirror Django's runtime behavior for unset fields:
+            #    "" for empty-strings-allowed CharField/TextField/etc.
+            #    that aren't nullable; None otherwise.
+            if getattr(f, "empty_strings_allowed", False) and not f.null:
+                return ""
+            return None
+
+        for f in fields:
+            self.__dict__[f.attname] = _initial_value_for(f)
+        for val, field in zip(args, fields):
+            self.__dict__[field.attname] = val
+        for name, val in kwargs.items():
+            self.__dict__[name] = val
+
+        # Populate the related-instance cache for ForeignKey fields. The
+        # forward descriptor reads ``_state.fields_cache[field.cache_name]``
+        # before falling through to a DB query — putting a constructed
+        # related instance there short-circuits the DB path entirely.
+        # Only at depth 0 to avoid infinite recursion on cyclic schemas.
+        if depth == 0:
+            for f in opts.fields:
+                if not (getattr(f, "is_relation", False)
+                        and getattr(f, "many_to_one", False)):
+                    continue
+                related_model = getattr(f, "related_model", None)
+                if related_model is None or related_model == "self":
+                    continue
+                cache_name = getattr(f, "cache_name", f.name)
+                try:
+                    self._state.fields_cache[cache_name] = related_model()
+                except BaseException:  # noqa: BLE001
+                    pass
+
+        # Apply registered constraints (max_length, choices, etc.) once
+        # symbolic values are in place. _apply_constraints comes from
+        # _crosshair_stubs (the manager-side proxies generated by
+        # /generate-stubs); skip silently if it's not installed.
+        if space is not None:
+            try:
+                from _crosshair_stubs import _apply_constraints
+                _apply_constraints(self, type(self))
+            except BaseException:  # noqa: BLE001
+                pass
+    finally:
+        _init_state.depth = depth
+
+
+_Model.__init__ = _patched_model_init
+
+
+# ---------------------------------------------------------------------------
+# Layer 2b: UUID.__init__ bypass
+# ---------------------------------------------------------------------------
+#
+# uuid.UUID.__init__ does ``if int >> 128: raise ValueError(...)`` on the
+# symbolic int CrossHair passes, tripping the same "Numeric operation on
+# symbolic while not tracing" wall. Bypass with a plain __dict__ assign.
+import uuid as _uuid
+
+
+def _patched_uuid_init(
+    self, hex=None, bytes=None, bytes_le=None, fields=None, int=None,
+    version=None, *, is_safe=_uuid.SafeUUID.unknown,
+):
+    if int is None:
+        int = 0
+    self.__dict__["int"] = int
+    self.__dict__["is_safe"] = is_safe
+
+
+_uuid.UUID.__init__ = _patched_uuid_init
+
+
+# ---------------------------------------------------------------------------
+# Layer 2c: forms.Field.__init__ minimal init
+# ---------------------------------------------------------------------------
+#
+# Real Field.__init__ iterates over ``error_messages`` and copies the
+# widget; both crash on symbolic params. Replace with a minimal init
+# that sets every attribute subclass __init__'s read (validators,
+# error_messages, widget, etc.) without iterating any kwargs.
+from django.forms.fields import Field as _FormField
+
+
+def _patched_field_init(self, *args, **kwargs):
+    self.required = True
+    self.label = None
+    self.initial = None
+    self.help_text = ""
+    self.disabled = False
+    self.label_suffix = None
+    self.bound_field_class = getattr(self, "bound_field_class", None)
+    self.localize = False
+    self.show_hidden_initial = False
+    self.template_name = None
+    # Walk the MRO to collect default_error_messages, mirroring the real
+    # Field.__init__. Without this, subclasses that raise
+    # ValidationError(code='required') KeyError on the message lookup.
+    messages = {}
+    for c in reversed(type(self).__mro__):
+        messages.update(getattr(c, "default_error_messages", {}))
+    self.error_messages = messages
+    self.validators = list(getattr(type(self), "default_validators", ()))
+    # Some subclass __init__'s (ChoiceField, etc.) do
+    # ``self.widget.choices = ...`` — give widget a real namespace.
+    import types as _types
+    self.widget = _types.SimpleNamespace(
+        attrs={}, is_required=False, is_localized=False, choices=[]
+    )
+
+
+_FormField.__init__ = _patched_field_init
+
+
+# ---------------------------------------------------------------------------
+# Layer 2d: BaseForm.__init__ + cleaned_data proxy
+# ---------------------------------------------------------------------------
+#
+# clean_X(self) methods read ``self.cleaned_data["X"]``. In production
+# that dict is populated by ``_clean_fields()`` before clean_X runs;
+# under symbolic exec we have to pre-fill it with one symbolic value
+# per declared field, matching the field's type.
+from django.forms.forms import BaseForm as _BaseForm
+
+_FORM_FIELD_TO_PY: dict = {
+    "CharField": str, "EmailField": str, "URLField": str,
+    "SlugField": str, "RegexField": str, "ChoiceField": str,
+    "TypedChoiceField": str,
+    "GenericIPAddressField": str, "IPAddressField": str,
+    "FilePathField": str,
+    "MultipleChoiceField": list, "TypedMultipleChoiceField": list,
+    "JSONField": str,
+    "IntegerField": int,
+    "FloatField": float,
+    "BooleanField": bool, "NullBooleanField": bool,
+    "DurationField": int,  # actual type is timedelta; int avoids tz proxy work
+}
+
+
+def _patched_baseform_init(self, *args, **kwargs):
+    # Set the framework attributes Form/Field methods read.
+    self.is_bound = False
+    self.data = {}
+    self.files = {}
+    self.auto_id = "id_%s"
+    self.initial = {}
+    self.empty_permitted = False
+    self._errors = None
+    self._bound_fields_cache = {}
+    self.label_suffix = ":"
+    self.bound_field_class = getattr(type(self), "bound_field_class", None)
+    self.renderer = None
+    # base_fields is set on the class by DeclarativeFieldsMetaclass;
+    # use it directly (clean_X methods don't typically mutate fields).
+    self.fields = getattr(type(self), "base_fields", {})
+
+    space = None
+    proxy_for_type = None
+    try:
+        from crosshair.statespace import context_statespace
+        from crosshair.core_and_libs import proxy_for_type as _pft
+        space = context_statespace()
+        proxy_for_type = _pft
+    except BaseException:  # noqa: BLE001
+        pass
+
+    cleaned: dict = {}
+    cls_name = type(self).__name__
+    for fname, fld in self.fields.items():
+        py_type = _FORM_FIELD_TO_PY.get(type(fld).__name__, str)
+        if space is not None and proxy_for_type is not None:
+            try:
+                cleaned[fname] = proxy_for_type(py_type, f"{cls_name}_cd_{fname}")
+                continue
+            except BaseException:  # noqa: BLE001
+                pass
+        # Concrete fallbacks
+        if py_type is str:
+            cleaned[fname] = ""
+        elif py_type is int:
+            cleaned[fname] = 0
+        elif py_type is bool:
+            cleaned[fname] = False
+        elif py_type is float:
+            cleaned[fname] = 0.0
+        elif py_type is list:
+            cleaned[fname] = []
+        else:
+            cleaned[fname] = None
+    self.cleaned_data = cleaned
+
+
+_BaseForm.__init__ = _patched_baseform_init
+
+
+# ---------------------------------------------------------------------------
+# Layer 3: Manager-side stubs (Model.objects.X())
+# ---------------------------------------------------------------------------
+#
+# Loads _crosshair_stubs.py (generated by Phase 4 of /generate-stubs),
+# which monkey-patches Model.objects with a MockManager that returns
+# proxy_for_type results with the schema constraint registry applied.
+try:
+    import _crosshair_stubs  # noqa: F401 — runs install_stubs() on import
+except BaseException as _exc:  # noqa: BLE001
+    import sys
+    print(f"[crosshair_django_setup] _crosshair_stubs not loaded: {_exc!r}",
+          file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Layer 4: Recursive type alias forward-reference resolution
+# ---------------------------------------------------------------------------
+#
+# Projects often define a recursive JSON-like type alias, e.g.:
+#     JSONDict = dict[str, "JSONValue"]
+#     JSONValue = JSONDict | JSONList | str | int | float | bool | None
+# Modules that import only ``JSONDict`` don't have ``JSONValue`` in their
+# ``__globals__``, so ``typing.get_type_hints(fn, fn_globals(fn))``
+# raises ``NameError`` on the forward ref and CrossHair drops the entire
+# signature — leading to "Skipping <fn> because it has no conditions"
+# even though the docstring contracts are valid.
+#
+# Wrap ``typing.get_type_hints`` to merge {{ typealias_module }}'s
+# namespace into the resolution globalns.
+{% if typealias_module %}
+try:
+    import sys as _sys_for_hints
+    import typing as _typing
+    from {{ typealias_module }} import *  # noqa: F401, F403 — pull names into a namespace dict
+    _typealias_mod = _sys_for_hints.modules["{{ typealias_module }}"]
+    _typealias_globals = vars(_typealias_mod)
+    _orig_get_type_hints = _typing.get_type_hints
+
+    # Bind cross-frame references via default args so the closure
+    # survives the plugin's exec scope being torn down.
+    def _patched_get_type_hints(
+        obj, globalns=None, localns=None, include_extras=False,
+        _typealias_globals=_typealias_globals,
+        _orig_get_type_hints=_orig_get_type_hints,
+        _sys=_sys_for_hints,
+    ):
+        if globalns is None:
+            try:
+                globalns = (
+                    getattr(obj, "__globals__", None)
+                    or vars(_sys.modules[getattr(obj, "__module__", "builtins")])
+                )
+            except (KeyError, AttributeError):
+                globalns = {}
+        merged = {**_typealias_globals, **globalns}
+        return _orig_get_type_hints(
+            obj, globalns=merged, localns=localns, include_extras=include_extras
+        )
+
+    _typing.get_type_hints = _patched_get_type_hints
+    # CrossHair binds get_type_hints at fnutil import time, so we have to
+    # rebind it on that module too.
+    import crosshair.fnutil as _ch_fnutil
+    _ch_fnutil.get_type_hints = _patched_get_type_hints
+except BaseException as _exc:  # noqa: BLE001
+    import sys
+    print(f"[crosshair_django_setup] typealias resolution skipped: {_exc!r}",
+          file=sys.stderr)
+{% endif %}

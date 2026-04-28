@@ -52,7 +52,7 @@ python -m py_compile _crosshair_registry_patch.py crosshair_django_setup.py
 ### Why these files are needed
 
 - **Why not `django.setup()`**: Loads all INSTALLED_APPS, runs every `AppConfig.ready()` hook, configures logging — none of this is needed for symbolic execution.
-- **The exec() scoping gotcha**: CrossHair `exec()`s the plugin inside `main()` without an explicit namespace. Class bodies in that context cannot see exec-local names for default arg evaluation (Python 3 limitation). The registry stubs **must** live in a real importable module (`_crosshair_registry_patch.py`), not defined inline in the plugin.
+- **The exec() scoping gotcha**: CrossHair `exec()`s the plugin inside `main()` without an explicit namespace. Class bodies AND function-body closures in that context cannot reliably see exec-local names (Python 3 scoping limitation — class-body name resolution is documented; function-body closures over exec-locals also fail at call time, observed in practice). Mitigations: stub *classes* must live in a real importable module (`_crosshair_registry_patch.py`); patched *functions* either re-import inside the body, or bind cross-frame references via default args. See `phase-5-symbolic-models.md` for examples.
 - **The all_models reference trick**: `_RegistryStubAppConfig.import_models()` stores a live reference to `apps.all_models[label]` (a dict). As Django imports real model files during the analysis import chain, they call `register_model()` which populates this same dict. Stub configs automatically see real models as they appear.
 
 ## Output
@@ -65,4 +65,10 @@ python -m py_compile _crosshair_registry_patch.py crosshair_django_setup.py
 
 For Django projects, also:
 - `_crosshair_registry_patch.py` — pure Python stub classes (no Django deps), importable module
-- `crosshair_django_setup.py` — CrossHair `--extra_plugin` that patches the Django app registry
+- `crosshair_django_setup.py` — CrossHair `--extra_plugin` that patches the Django app registry **plus** the Model/UUID/Form `__init__` chain that makes direct-construction symbolic. See `phase-5-symbolic-models.md` for the rationale and the four layers the template builds.
+
+If the project defines a recursive type alias module (e.g. `myapp/typealias.py`
+with `JSONDict = dict[str, "JSONValue"]`), pass its dotted module path as
+the `typealias_module` template parameter so the plugin can wrap
+`typing.get_type_hints` to resolve forward references. Leave empty if
+the project has no such module.
