@@ -192,6 +192,16 @@ Even with all three layers, some functions stay UNKNOWN:
   `decimal.Decimal`, complex `pydantic.BaseModel` subclasses with
   custom validators, etc. Workaround: contract a wrapper that takes
   primitives.
+- **`async def` functions** — CrossHair simply does not analyze
+  async functions. They produce
+  `WARNING: Targets found, but contain no checkable functions.`
+  This is structural: FastAPI / Starlette projects with
+  `async def` route handlers, `async def` dependency-injection
+  functions, etc. are effectively unanalyzable as written.
+  For an async-heavy codebase, the realistic CrossHair surface
+  shrinks to the sync repository / service / parser / sanitizer
+  layer underneath the routes. Note this in the run script's
+  comment so reviewers don't get confused.
 
 ## Generation
 
@@ -206,3 +216,188 @@ also:
    user passes to `crosshair --extra_plugin`. The
    `_crosshair_registry_patch.py` and `_crosshair_stubs.py`
    companions are imported automatically.
+
+---
+
+## Alternative: `register_type` factories
+
+Layer A patches `Model.__init__` so any user-code call to `User(...)`
+gets symbolic fields. There's a complementary approach: register a
+custom factory with `crosshair.register_type` so CrossHair uses it
+when synthesizing a function *argument* of the model type.
+
+Both can coexist, but the registration approach is more surgical —
+it intervenes only at the boundary where CrossHair generates args
+for the function under analysis, leaving real `Model(...)` calls in
+the function body untouched. This was added to one project (Zulip)
+in 2026-05 and unblocked ~33 action files + ~65 view files whose
+signatures took `UserProfile`, `Realm`, `Stream`, etc.
+
+### Sketch
+
+```python
+from crosshair import register_type, ResumedTracing
+from crosshair.core_and_libs import proxy_for_type
+
+def _make_symbolic_model(model_class, factory):
+    from django.db.models.base import ModelState
+    instance = model_class.__new__(model_class)              # bypass __init__
+    instance.__dict__["_state"] = ModelState()
+    instance._state.adding = False
+    instance._state.db = "default"
+    for col, info in _load_constraints()[key].items():
+        ftype = info["type"]
+        if ftype in ("ForeignKey", "OneToOneField"):
+            # Set symbolic FK id; let the patched FK descriptor
+            # synthesize the related object lazily on first access
+            # to avoid infinite recursion in cyclic schemas.
+            instance.__dict__[col] = factory(int, col)
+        elif ftype in CHARFIELD_TYPES:
+            val = factory(str, col)
+            with ResumedTracing():                             # ← critical
+                if "max_length" in info:
+                    space.add(len(val) <= info["max_length"])
+            instance.__dict__[col] = val
+        # ... int / bool / autofield branches
+
+def _register_symbolic_models():
+    import importlib
+    for key in _load_constraints():
+        module_name, _, class_name = key.rpartition(".")
+        try:
+            model = getattr(importlib.import_module(module_name), class_name)
+        except (ImportError, AttributeError):
+            continue
+        # Default-arg `m=model` is required: closure-by-reference
+        # would make every lambda see the LAST model in the loop.
+        register_type(model, lambda factory, m=model: _make_symbolic_model(m, factory))
+```
+
+### Two gotchas not present in the `_patched_model_init` path
+
+#### 1. `with ResumedTracing()` around `space.add(...)`
+
+A `register_type` factory runs during `gen_args`, which executes with
+tracing **paused** (`COMPOSITE_TRACER` is off). Calling
+`context_statespace().add(symbolic_expr)` from that context crashes:
+
+```
+crosshair.util.CrossHairInternal: Numeric operation on symbolic while not tracing
+```
+
+Wrap any constraint application in `with ResumedTracing()`:
+
+```python
+from crosshair import ResumedTracing
+with ResumedTracing():
+    space.add(len(val) <= max_length)
+```
+
+The Layer A `_patched_model_init` doesn't need this because user-code
+`Model(...)` calls happen inside the traced function body — tracing
+is already on.
+
+#### 2. FK descriptor `__get__` patch must use `field.name`, not `get_cache_name()`
+
+The Layer B description in this doc references `field.cache_name` but
+in newer Django versions `FieldCacheMixin.get_cache_name()` raises
+`NotImplementedError` on the abstract base, and what gets resolved
+depends on the concrete field class hierarchy. The simple,
+version-stable cache key is `self.field.name`:
+
+```python
+def _fk_descriptor_get(self, instance, cls=None):
+    if instance is None:
+        return self
+    cache_name = self.field.name                              # not get_cache_name()
+    cache = instance._state.fields_cache
+    if cache_name in cache:
+        return cache[cache_name]
+    related = proxy_for_type(self.field.related_model, f"_fk_{cache_name}")
+    cache[cache_name] = related
+    return related
+```
+
+Patch it on **both** `ForwardManyToOneDescriptor.__get__` (regular
+ForeignKey) and `ForwardOneToOneDescriptor.__get__` (OneToOneField).
+Patching just the setter (`ForeignKeyDeferredAttribute.__set__`) is
+not enough — reads route through the descriptor's `__get__`, which
+on cache miss issues a real DB query.
+
+### When to prefer this over Layer A
+
+- Code under analysis treats model arguments as opaque (passes them
+  along, reads a few fields). The factory's symbolic fields suffice.
+- You want to leave `Model.__init__` semantics intact for any
+  *internal* construction CrossHair encounters.
+- The schema is cyclic and you don't want to manage a depth counter
+  — `register_type` produces a fresh proxy per gen_args call, and
+  FKs only resolve on access via the descriptor patch.
+
+### When to prefer Layer A (`_patched_model_init`)
+
+- Code under analysis constructs models internally via
+  `Model(field=val, ...)` and the construction itself needs to
+  produce a symbolic instance.
+- You need symbolic Form / BaseForm support (Layer C builds on
+  Layer A's init-patch infrastructure).
+
+---
+
+## Pre-resolving generic type parameters at install time
+
+A common shape for application-layer wrappers around the ORM:
+
+```python
+class RepositoryGeneric[Schema: BaseModel, Model: SqlAlchemyBase]:
+    def __init__(self, session, primary_key, sql_model: type[Model],
+                 schema: type[Schema]) -> None: ...
+
+class RepositoryUsers(GroupRepositoryGeneric[PrivateUser, User]):
+    ...
+```
+
+When stubbing the constructor of such a class, the no-op `__init__`
+needs to bind `self.model` and `self.schema` to *concrete* classes
+(they're later used in `select(self.model)` and
+`self.schema.model_validate(...)` — neither survives a symbolic
+proxy). Don't ask CrossHair to generate symbolic types — instead
+pre-resolve them from each subclass's generic base.
+
+```python
+from typing import get_args
+
+repo_generics: dict[type, tuple[type, type]] = {}
+
+for cls in _all_subclasses(RepositoryGeneric):
+    for base in getattr(cls, '__orig_bases__', ()):
+        try:
+            args = get_args(base)
+        except Exception:
+            continue
+        if (len(args) >= 2
+                and isinstance(args[0], type)
+                and isinstance(args[1], type)):
+            repo_generics[cls] = (args[0], args[1])
+            break
+
+# Later, in the patched __init__:
+def _repo_init(self, *args, **kwargs):
+    ...
+    sg = repo_generics.get(type(self))
+    if sg is not None:
+        schema_cls, model_cls = sg
+        object.__setattr__(self, 'schema', schema_cls)
+        object.__setattr__(self, 'model', model_cls)
+    ...
+```
+
+The same pre-resolution applies to any `Generic[T, U]` subclass
+where the concrete types are required at runtime. This pattern
+keeps the patched `__init__` lightweight (one dict lookup) instead
+of doing `get_args(__orig_bases__[0])` every construction.
+
+Caveat: `__orig_bases__` is only populated on classes that
+*directly* parameterize a `Generic` (or PEP 695 generic) base.
+Subclasses that inherit from already-parameterized bases get the
+empty `()`. Walk the MRO if the project has deeper hierarchies.

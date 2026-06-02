@@ -96,6 +96,41 @@ pre: hasattr(model_class, '_meta') or (isinstance(model_class, type) and hasattr
 
 ---
 
+## `hasattr` Preconditions on Untyped Args — Silent Analysis Death
+
+**`hasattr(user, 'is_superuser')` (or any `hasattr` precondition) on a parameter without a type annotation will silently kill analysis.**
+
+When a parameter has no type annotation, CrossHair generates symbolic values by trying primitive types first (`int`, `str`, etc.). None of those have `.is_superuser`, so the `hasattr` precondition fails for every iteration. CrossHair reports the function as "clean" but it never actually ran the body. `post: False` also returns clean — definitive symptom.
+
+**Diagnosis** (verbose run):
+
+```
+attempt_call() Failed to meet precondition hasattr(user, 'is_superuser')
+analyze_calltree() Iter complete. Worst status found so far: UNKNOWN
+```
+
+**Fix:** Add the type annotation so CrossHair generates the right kind of mock:
+
+```python
+# Before — silently fails:
+def f(user, ...):
+    """
+    pre: hasattr(user, 'is_superuser')
+    """
+
+# After — CrossHair uses the ORM stub's User mock:
+def f(user: User, ...):
+    """
+    pre: hasattr(user, 'is_superuser')
+    """
+```
+
+**Caveat:** for `AbstractUser`-derived `User` (Django auth), the proxy construction itself is intractable. See **`crosshair-django/references/plugin-patterns.md` Pattern 5g** for `register_type`/`SimpleNamespace` workarounds.
+
+**Verifying analysis is reaching the body:** temporarily insert `post: False`. A reachable function ALWAYS surfaces a counterexample for `post: False`. If it doesn't, your preconditions or proxy construction are silently aborting before the body.
+
+---
+
 ## Summary: Quick Reference
 
 | Pattern | Use |
@@ -108,3 +143,5 @@ pre: hasattr(model_class, '_meta') or (isinstance(model_class, type) and hasattr
 | `hasattr(compiler, 'compile')` | Guard for Django SQL compiler |
 | `s.isdecimal()` not `s.isdigit()` | Before calling `int(s)` or `float(s)` |
 | Avoid `len(__return__) == len(value)` | After `str.upper()` / `str.lower()` |
+| Annotate args before using `hasattr(...)` pre: | Untyped + `hasattr` → silent analysis death |
+| `post: False` as reachability probe | A reachable body ALWAYS surfaces a CE for `post: False` |

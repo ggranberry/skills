@@ -59,10 +59,11 @@ Each phase reads a reference file with its full prompt. This keeps the orchestra
 bash .claude/skills/detect-orm/scripts/detect-orm.sh > .claude/artifacts/crosshair-bugs/orm-detection.json
 ```
 
-**If the detected ORM is Django**, follow the `crosshair-django` pre-flight before Phase 2:
-read `.claude/skills/crosshair-django/references/preflight.md` and complete its checklist
-(install dependencies into the CrossHair venv, create the `crosshair_django_setup.py` plugin,
-confirm a testing settings module, add `--unblock` flags).
+**Choose ORM-specific pre-flight before Phase 2:**
+
+- **Django:** read `.claude/skills/crosshair-django/references/preflight.md` and complete its checklist (install dependencies, create `crosshair_django_setup.py`, confirm testing settings module).
+- **SQLAlchemy:** read `.claude/skills/crosshair-sqlalchemy/references/preflight.md` (install drivers, create `crosshair_sqlalchemy_setup.py` with the auditwall pre-import block).
+- **Both Django + SQLAlchemy** (e.g. Mathesar): do Django's preflight first, then append the SQLAlchemy native-driver pre-import block from the SQLAlchemy plugin patterns onto the existing `crosshair_django_setup.py`.
 
 ### Phase 2: Generate Base Stubs
 
@@ -112,6 +113,7 @@ Do NOT remove PEP 316 contracts or stubs after analysis. Contracts serve as exec
 |-------|-------|---------|
 | detect-orm | 1 | Identify ORM and model files |
 | crosshair-django | 1 (post), 6, 9 | Django/DRF pre-flight, contract patterns, run-script flags (Django only) |
+| crosshair-sqlalchemy | 1 (post), 6, 9 | SQLAlchemy pre-flight, driver pre-loading, forward-ref workarounds (SQLAlchemy only) |
 | generate-stubs | 2 | Base stub templates |
 | parse-migrations | 3 | Constraint extraction patterns |
 | generate-contracts | 5–8 | PEP 316 contract discovery, planning, application, validation |

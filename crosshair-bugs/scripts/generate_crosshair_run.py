@@ -53,10 +53,22 @@ def main():
     if not applied:
         sys.exit("ERROR: No plan files with '## Applied' found. Run phases 6-7 first.")
 
-    # Detect Django
+    # Detect Django and build plugin flags
     with open(f"{ARTIFACTS}/orm-detection.json") as f:
-        orm = json.load(f).get("orm", "")
-    django_flag = "--extra_plugin crosshair_django_setup.py" if orm == "django" else ""
+        orm_data = json.load(f)
+    orms = [o.get("orm", "") for o in orm_data.get("orms_detected", [])]
+    is_django = "django" in orms
+
+    # Always include _crosshair_stubs.py; additionally include Django plugin if needed.
+    # IMPORTANT: --extra_plugin has nargs="+" in crosshair's argparse, so emit a SINGLE
+    # flag with multiple values, not multiple flags. The latter (e.g.
+    # `--extra_plugin a.py --extra_plugin b.py`) is silently overwritten by argparse —
+    # only the last value sticks and the stub plugin never loads. Confirmed against
+    # crosshair v0.0.102 main.py:921 `for plugin in args.extra_plugin: exec(...)`.
+    plugin_files = ["_crosshair_stubs.py"]
+    if is_django:
+        plugin_files.append("crosshair_django_setup.py")
+    plugin_flags = ["--extra_plugin"] + plugin_files
 
     # Ensure output directory exists
     os.makedirs(CROSSHAIR_DIR, exist_ok=True)
@@ -72,9 +84,7 @@ def main():
         if os.path.exists(outfile):
             skipped.append(fp)
             continue
-        parts = [crosshair, "check", fp]
-        if django_flag:
-            parts.append(django_flag)
+        parts = [crosshair, "check", fp] + plugin_flags
         parts += ["--per_condition_timeout", "30", "--analysis_kind", "PEP316"]
         cmd = " ".join(parts) + f" > {outfile} 2>&1"
         lines.append(cmd)

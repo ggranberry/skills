@@ -106,16 +106,35 @@ Full example invocation:
 
 ---
 
-## Step 5: Accept ctypes/ldconfig `SideEffectDetected` as Permanent Noise
+## Step 5: Pre-import side-effect-laden modules in the plugin
 
-Some Django/system calls (particularly those that load shared libraries via `ctypes` or invoke `ldconfig`) produce `SideEffectDetected` errors that cannot be suppressed with `--unblock`. These are permanent noise:
+`SideEffectDetected` errors from `ctypes`/`ldconfig`/`subprocess.Popen`/`/tmp` writes during native library loading (cairocffi, psycopg2, cryptography, SQLAlchemy dialects) are **not** permanent noise — they can be eliminated by pre-importing those modules with auditwall disabled inside the plugin.
 
+See **`plugin-patterns.md` → Pattern 1** for the full code template. The short version: at the end of the plugin, do:
+
+```python
+from crosshair import auditwall as _auditwall
+import importlib
+
+_auditwall.disable_auditwall()
+try:
+    for _mod in ("cairocffi", "cairosvg", "psycopg2", "cryptography",
+                 "sqlalchemy", "django.contrib.auth.hashers"):
+        try:
+            importlib.import_module(_mod)
+        except ImportError:
+            pass
+    import ctypes.util as _ctypes_util
+    _ctypes_util.find_library("c")
+finally:
+    _auditwall._ENABLED = True   # NB: engage_auditwall() does NOT re-arm
 ```
-SideEffectDetected: ctypes.CDLL(...)
-SideEffectDetected: subprocess.run(['ldconfig', ...])
-```
 
-**Do not treat these as bugs or false positives.** They are framework-level library loading that CrossHair cannot model. When classifying counterexamples in Phase 9, mark any finding whose root cause is a `ctypes`/`ldconfig` side effect as **infrastructure noise** and exclude it from the bug report.
+After this fix, `--unblock subprocess.Popen` and `--unblock os.posix_spawn` are usually unnecessary. If you still see a side-effect error, the traceback names the offending module — add it to the pre-import list.
+
+Only treat `SideEffectDetected` as permanent noise when:
+- The error originates from inside CrossHair-instrumented user code (not module import), AND
+- Pre-importing the source module did not help.
 
 ---
 
@@ -128,4 +147,50 @@ Before running CrossHair on a Django project:
 - [ ] Testing settings module confirmed (no live DB/Redis required at import)
 - [ ] `--extra_plugin crosshair_django_setup.py` added to every `crosshair check` command
 - [ ] `--unblock` flags added for subprocess.Popen, os.posix_spawn, socket.connect, socket.getaddrinfo
+- [ ] **Multiple `--unblock` events go after a SINGLE `--unblock` flag**, terminated with `--` before TARGET (see Pitfall below)
 - [ ] ctypes/ldconfig side effects noted as permanent noise (not classified as bugs)
+
+---
+
+## Pitfall: `--unblock` argparse quirk
+
+`crosshair check` defines `--unblock EVENT [EVENT ...]` with `nargs='+'`. Two failure modes that look completely different both trace back to this:
+
+**Failure mode A — silent override:**
+```bash
+# Only the LAST --unblock=... takes effect; earlier ones are silently ignored.
+crosshair check --unblock=open --unblock=subprocess.Popen target.py
+```
+Symptom: `ValueError: Unable to configure handler 'X'` from Django logging during plugin import (because `--unblock=open` was overridden by the later `--unblock=subprocess.Popen`).
+
+**Failure mode B — TARGET consumed as event:**
+```bash
+# `target.py` is parsed as a third event; argparse complains TARGET is missing.
+crosshair check --unblock open subprocess.Popen target.py
+```
+Symptom: `crosshair check: error: the following arguments are required: TARGET`.
+
+**Right form:**
+```bash
+crosshair check \
+  --extra_plugin crosshair_django_setup.py \
+  --per_path_timeout 300 \
+  --analysis_kind PEP316 \
+  --unblock open subprocess.Popen -- \
+  target.py
+```
+
+The `--` ends event collection so the positional argument is parsed correctly. In a Python runner script:
+
+```python
+cmd = [
+    venv_python, "-m", "crosshair", "check",
+    "--extra_plugin", plugin,
+    "--per_path_timeout", "300",
+    "--analysis_kind", "PEP316",
+    "--unblock", "open", "subprocess.Popen", "--",
+    str(target),
+]
+```
+
+The `--` costs nothing and avoids both failure modes.

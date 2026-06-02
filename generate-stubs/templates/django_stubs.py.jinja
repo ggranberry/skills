@@ -23,11 +23,95 @@ except ImportError:
 T = TypeVar('T')
 
 
+def _field_python_type(model_type: type, field_name: str) -> type:
+    """Map a Django field (looked up by name on ``model_type``) to a Python type.
+
+    Used to model ``queryset.values_list(field, flat=True)`` correctly: real
+    Django yields field values, but the default MockQuerySet would yield model
+    instances. Falls back to ``object`` if the field can't be resolved.
+    """
+    try:
+        from django.db import models as _m
+    except ImportError:
+        return object
+    try:
+        field = model_type._meta.get_field(field_name)
+    except Exception:
+        return object
+    if isinstance(field, _m.BooleanField):
+        return bool
+    if isinstance(field, _m.IntegerField):  # covers Small/Big/Positive variants
+        return int
+    if isinstance(field, _m.FloatField):
+        return float
+    if isinstance(field, _m.DateTimeField):
+        from datetime import datetime
+        return datetime
+    if isinstance(field, _m.DateField):
+        from datetime import date
+        return date
+    if isinstance(field, _m.TimeField):
+        from datetime import time
+        return time
+    if isinstance(field, _m.DurationField):
+        from datetime import timedelta
+        return timedelta
+    if isinstance(field, _m.UUIDField):
+        from uuid import UUID
+        return UUID
+    if isinstance(field, _m.DecimalField):
+        from decimal import Decimal
+        return Decimal
+    if isinstance(field, _m.BinaryField):
+        return bytes
+    if isinstance(field, _m.JSONField):
+        return object
+    if isinstance(field, _m.ForeignKey):
+        # values_list('user') yields the FK id (an int).
+        return int
+    if isinstance(field, (_m.CharField, _m.TextField)):
+        return str
+    return object
+
+
 class MockQuerySet(Generic[T]):
     """Mock Django QuerySet that returns symbolic values."""
 
-    def __init__(self, model_type: type):
+    def __init__(self, model_type: type, values_fields: Optional[Tuple[str, ...]] = None,
+                 values_flat: bool = False, values_named: bool = False) -> None:
         self.model_type = model_type
+        # When set, the queryset yields field projections (a la ``values_list``)
+        # rather than model instances:
+        #   values_fields=('last_error',), values_flat=True  → yields field values
+        #   values_fields=('a', 'b'),       values_flat=False → yields tuples
+        #   set via .values(...)                              → yields dicts
+        self._values_fields = values_fields
+        self._values_flat = values_flat
+        self._values_named = values_named  # values() vs values_list()
+
+    def _element_type(self) -> type:
+        """The Python type a single iterated element should have."""
+        if self._values_fields is None:
+            return self.model_type
+        if self._values_named:
+            return dict  # values() yields dicts
+        types = [_field_python_type(self.model_type, f) for f in self._values_fields]
+        if not types:
+            return object
+        if self._values_flat:
+            # Django requires exactly one field with flat=True; trust that.
+            return types[0]
+        # Multi-field values_list yields typed tuples. ``Tuple[tuple(types)]``
+        # is the dynamic equivalent of writing ``Tuple[t1, t2, ...]`` at
+        # source. Without this, the elements come out as plain untyped
+        # ``tuple`` and comparisons (e.g. ``sorted(events, reverse=True)``)
+        # fail with TypeError when callers mix them with concretely-typed
+        # tuples.
+        return Tuple[tuple(types)]
+
+    def _projected(self, fields: Tuple[str, ...], flat: bool, named: bool) -> 'MockQuerySet[T]':
+        return MockQuerySet(self.model_type, values_fields=fields,
+                            values_flat=flat, values_named=named)
 
     # Chainable methods
     def filter(self, *args: Any, **kwargs: Any) -> 'MockQuerySet[T]':
@@ -52,35 +136,88 @@ class MockQuerySet(Generic[T]):
         return self
 
     def values(self, *args: str) -> 'MockQuerySet[T]':
-        return self
+        return self._projected(args, flat=False, named=True)
 
     def values_list(self, *args: str, **kwargs: Any) -> 'MockQuerySet[T]':
-        return self
+        flat = bool(kwargs.get('flat', False))
+        return self._projected(args, flat=flat, named=False)
 
-    # Terminal methods
+    # Iteration: ``for x in qs`` and ``list(qs)`` both go through __iter__.
+    # The element type reflects ``.values_list(...)`` / ``.values(...)``
+    # projection state, so a values_list yields field-typed values rather
+    # than model instances.
+    def __iter__(self):
+        return iter(proxy_for_type(List[self._element_type()], 'db_queryset_iter'))
+
+    # Terminal methods. When a projection is active, callers expect the
+    # projected element type rather than a model instance.
     def get(self, *args: Any, **kwargs: Any) -> T:
+        if self._values_fields is not None:
+            return proxy_for_type(self._element_type(), 'db_queryset_get_values')
         return proxy_for_type(self.model_type, 'db_queryset_get')
 
     def first(self) -> Optional[T]:
+        if self._values_fields is not None:
+            return proxy_for_type(Optional[self._element_type()], 'db_queryset_first_values')
         return proxy_for_type(Optional[self.model_type], 'db_queryset_first')
 
     def last(self) -> Optional[T]:
+        if self._values_fields is not None:
+            return proxy_for_type(Optional[self._element_type()], 'db_queryset_last_values')
         return proxy_for_type(Optional[self.model_type], 'db_queryset_last')
 
-    def all(self) -> List[T]:
-        return proxy_for_type(List[self.model_type], 'db_queryset_all')
+    def all(self) -> 'MockQuerySet[T]':
+        # Real Django QuerySet.all() returns a (new) QuerySet — NOT a list.
+        # Returning `self` matches semantics AND avoids calling proxy_for_type
+        # at module-import time (e.g. when a Django form's ModelChoiceField does
+        # `queryset=Foo.objects.none()` at class-body load), where no statespace
+        # exists yet and proxy_for_type raises CrossHairInternal.
+        return self
 
+    def none(self) -> 'MockQuerySet[T]':
+        # Same import-time safety story: return self, never a List proxy.
+        return self
+
+    def using(self, *args: Any, **kwargs: Any) -> 'MockQuerySet[T]':
+        return self
+
+    def reverse(self) -> 'MockQuerySet[T]':
+        return self
+
+    def only(self, *args: str) -> 'MockQuerySet[T]':
+        return self
+
+    def defer(self, *args: str) -> 'MockQuerySet[T]':
+        return self
+
+    # Terminal methods: wrap proxy_for_type in try/except BaseException with
+    # safe fallbacks so module-import-time callers (Django form metaclasses,
+    # admin registration, etc.) get a concrete value instead of crashing on
+    # `Not in a statespace context`. The fallback values match real Django
+    # defaults for an empty queryset.
     def count(self) -> int:
-        return proxy_for_type(int, 'db_queryset_count')
+        try:
+            return proxy_for_type(int, 'db_queryset_count')
+        except BaseException:
+            return 0
 
     def exists(self) -> bool:
-        return proxy_for_type(bool, 'db_queryset_exists')
+        try:
+            return proxy_for_type(bool, 'db_queryset_exists')
+        except BaseException:
+            return False
 
     def update(self, **kwargs: Any) -> int:
-        return proxy_for_type(int, 'db_queryset_update')
+        try:
+            return proxy_for_type(int, 'db_queryset_update')
+        except BaseException:
+            return 0
 
     def delete(self) -> Tuple[int, dict]:
-        return proxy_for_type(Tuple[int, dict], 'db_queryset_delete')
+        try:
+            return proxy_for_type(Tuple[int, dict], 'db_queryset_delete')
+        except BaseException:
+            return (0, {})
 
     def create(self, **kwargs: Any) -> T:
         return proxy_for_type(self.model_type, 'db_queryset_create')
@@ -88,9 +225,24 @@ class MockQuerySet(Generic[T]):
     def get_or_create(self, defaults: Optional[dict] = None, **kwargs: Any) -> Tuple[T, bool]:
         return proxy_for_type(Tuple[self.model_type, bool], 'db_queryset_get_or_create')
 
+    def update_or_create(self, defaults: Optional[dict] = None, **kwargs: Any) -> Tuple[T, bool]:
+        return proxy_for_type(Tuple[self.model_type, bool], 'db_queryset_update_or_create')
+
+    def bulk_create(self, objs: Any, *args: Any, **kwargs: Any) -> List[T]:
+        return proxy_for_type(List[self.model_type], 'db_queryset_bulk_create')
+
+    def bulk_update(self, objs: Any, fields: Any, *args: Any, **kwargs: Any) -> int:
+        return proxy_for_type(int, 'db_queryset_bulk_update')
+
 
 class MockManager(Generic[T]):
-    """Mock Django Manager (Model.objects)."""
+    """Mock Django Manager (Model.objects).
+
+    Also used for reverse-relation accessors (``project.check_set``,
+    ``check.channel_set``) installed by ``_patch_reverse_relations``, so it
+    mirrors the chainable and terminal methods Django's Manager delegates from
+    its default queryset, plus the M2M-style mutators (``set/add/remove/clear``).
+    """
 
     def __init__(self, model_type: type):
         self.model_type = model_type
@@ -98,10 +250,55 @@ class MockManager(Generic[T]):
     def all(self) -> MockQuerySet[T]:
         return MockQuerySet(self.model_type)
 
+    def none(self) -> MockQuerySet[T]:
+        # Django form fields (e.g. ModelChoiceField) call
+        # ``Foo.objects.none()`` in class bodies at import time. The
+        # downstream framework then calls ``.all()`` on the result; both
+        # need to work without a statespace.
+        return MockQuerySet(self.model_type)
+
+    def using(self, *args: Any, **kwargs: Any) -> 'MockManager[T]':
+        return self
+
     def filter(self, *args: Any, **kwargs: Any) -> MockQuerySet[T]:
         return MockQuerySet(self.model_type)
 
     def exclude(self, *args: Any, **kwargs: Any) -> MockQuerySet[T]:
+        return MockQuerySet(self.model_type)
+
+    def select_related(self, *args: str) -> MockQuerySet[T]:
+        return MockQuerySet(self.model_type)
+
+    def prefetch_related(self, *args: str) -> MockQuerySet[T]:
+        return MockQuerySet(self.model_type)
+
+    def order_by(self, *args: str) -> MockQuerySet[T]:
+        return MockQuerySet(self.model_type)
+
+    # Django's Manager delegates these to its default queryset. Mirror them
+    # here so e.g. ``project.channel_set.values_list("last_error", flat=True)``
+    # works without first calling ``.all()``. The projection (which fields,
+    # flat vs tuples vs dicts) is captured on the returned MockQuerySet so its
+    # iteration yields values of the correct Python type rather than model
+    # instances.
+    def values(self, *args: str) -> MockQuerySet[T]:
+        return MockQuerySet(self.model_type, values_fields=args,
+                            values_flat=False, values_named=True)
+
+    def values_list(self, *args: str, **kwargs: Any) -> MockQuerySet[T]:
+        flat = bool(kwargs.get('flat', False))
+        return MockQuerySet(self.model_type, values_fields=args, values_flat=flat)
+
+    def annotate(self, *args: Any, **kwargs: Any) -> MockQuerySet[T]:
+        return MockQuerySet(self.model_type)
+
+    def distinct(self, *args: str) -> MockQuerySet[T]:
+        return MockQuerySet(self.model_type)
+
+    def only(self, *args: str) -> MockQuerySet[T]:
+        return MockQuerySet(self.model_type)
+
+    def defer(self, *args: str) -> MockQuerySet[T]:
         return MockQuerySet(self.model_type)
 
     def get(self, *args: Any, **kwargs: Any) -> T:
@@ -113,11 +310,88 @@ class MockManager(Generic[T]):
     def get_or_create(self, defaults: Optional[dict] = None, **kwargs: Any) -> Tuple[T, bool]:
         return proxy_for_type(Tuple[self.model_type, bool], 'db_manager_get_or_create')
 
+    def update_or_create(self, defaults: Optional[dict] = None, **kwargs: Any) -> Tuple[T, bool]:
+        return proxy_for_type(Tuple[self.model_type, bool], 'db_manager_update_or_create')
+
+    def bulk_create(self, objs: Any, *args: Any, **kwargs: Any) -> List[T]:
+        return proxy_for_type(List[self.model_type], 'db_manager_bulk_create')
+
+    def bulk_update(self, objs: Any, fields: Any, *args: Any, **kwargs: Any) -> int:
+        return proxy_for_type(int, 'db_manager_bulk_update')
+
+    # M2M / reverse-relation mutators (also exposed on related managers).
+    # Real Django returns None from these.
+    def add(self, *objs: Any, **kwargs: Any) -> None:
+        return None
+
+    def remove(self, *objs: Any, **kwargs: Any) -> None:
+        return None
+
+    def clear(self) -> None:
+        return None
+
+    def set(self, objs: Any, *args: Any, **kwargs: Any) -> None:
+        return None
+
     def count(self) -> int:
-        return proxy_for_type(int, 'db_manager_count')
+        try:
+            return proxy_for_type(int, 'db_manager_count')
+        except BaseException:
+            return 0
 
     def exists(self) -> bool:
-        return proxy_for_type(bool, 'db_manager_exists')
+        try:
+            return proxy_for_type(bool, 'db_manager_exists')
+        except BaseException:
+            return False
+
+    # Terminal methods Django Manager also exposes via delegation.
+    def first(self) -> Optional[T]:
+        return proxy_for_type(Optional[self.model_type], 'db_manager_first')
+
+    def last(self) -> Optional[T]:
+        return proxy_for_type(Optional[self.model_type], 'db_manager_last')
+
+    def update(self, **kwargs: Any) -> int:
+        return proxy_for_type(int, 'db_manager_update')
+
+    def delete(self) -> Tuple[int, dict]:
+        return proxy_for_type(Tuple[int, dict], 'db_manager_delete')
+
+    # M2M-style mutators used on related managers (e.g. ``check.channel_set.set([...])``).
+    # Modelled as no-ops because they do not return values useful to symbolic execution.
+    def set(self, objs: Any, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def add(self, *objs: Any, **kwargs: Any) -> None:
+        pass
+
+    def remove(self, *objs: Any) -> None:
+        pass
+
+    def clear(self) -> None:
+        pass
+
+    # Iteration on a Manager/RelatedManager mirrors QuerySet behaviour in Django.
+    def __iter__(self):
+        return iter(proxy_for_type(List[self.model_type], 'db_manager_iter'))
+
+    # Fallback for custom Manager methods (e.g. ``Profile.objects.for_user``).
+    # Many projects define convenience methods on a custom Manager subclass
+    # that ultimately wrap a ``.get(...)`` or ``.filter(...).first()`` and
+    # return a model instance (sometimes Optional). Without this fallback,
+    # any contracted code path that hits such a method raises AttributeError
+    # and CrossHair never reaches the body. The model-instance return covers
+    # the most common shape; callers that branch on None still get explored
+    # because attribute access on the returned proxy is symbolic.
+    def __getattr__(self, name: str) -> Any:
+        # ``__getattr__`` is only consulted when normal attribute lookup
+        # fails, so the explicit methods above still take precedence.
+        if name.startswith('_'):
+            raise AttributeError(name)
+        def _custom_manager_method(*args: Any, **kwargs: Any) -> Any:
+            return proxy_for_type(self.model_type, f'db_manager_custom_{name}')
+        return _custom_manager_method
 
 
 def mock_save(self: Any, *args: Any, **kwargs: Any) -> None:
@@ -128,6 +402,53 @@ def mock_delete(self: Any, *args: Any, **kwargs: Any) -> Tuple[int, dict]:
 
 def mock_refresh_from_db(self: Any, *args: Any, **kwargs: Any) -> None:
     pass
+
+
+def _patch_reverse_relations(model_class: type) -> None:
+    """Replace Django reverse-relation and forward-M2M descriptors with stubs.
+
+    For each reverse relation and forward M2M on ``model_class``:
+      - ManyToOneRel / ManyToManyRel / forward M2M  → property returning MockManager(related)
+      - OneToOneRel  → property returning a symbolic instance via proxy_for_type
+
+    Without this, attribute access like ``project.check_set`` falls through to
+    Django's real descriptor which queries the database.
+    """
+    try:
+        meta = model_class._meta
+    except AttributeError:
+        return
+
+    for rel in list(meta.related_objects):
+        accessor = rel.get_accessor_name()
+        if not accessor:
+            continue  # related_name='+' disables reverse access
+        related_model = rel.related_model
+        cls_name = rel.__class__.__name__
+        if cls_name == 'OneToOneRel':
+            # ``user.profile`` returns a single Profile instance.
+            setattr(
+                model_class,
+                accessor,
+                property(lambda self, rm=related_model: proxy_for_type(
+                    rm, f'reverse_one_to_one_{rm.__name__}',
+                )),
+            )
+        else:
+            # ManyToOneRel / ManyToManyRel — manager-style access.
+            setattr(
+                model_class,
+                accessor,
+                property(lambda self, rm=related_model: MockManager(rm)),
+            )
+
+    for field in list(meta.many_to_many):
+        related_model = field.related_model
+        setattr(
+            model_class,
+            field.name,
+            property(lambda self, rm=related_model: MockManager(rm)),
+        )
 
 
 def install_stubs() -> None:
@@ -148,10 +469,86 @@ def install_stubs() -> None:
         {{ table.model_class }}.refresh_from_db = mock_refresh_from_db
 {% endfor %}
 
+        # Patch reverse-relation and forward-M2M accessors so code that uses
+        # ``project.check_set.all()``, ``check.channel_set.filter(...)``,
+        # ``user.profile``, etc. can be exercised symbolically instead of
+        # falling through to the real Django descriptor (which queries the DB).
+{% for table_name, table in tables.items() %}
+        _patch_reverse_relations({{ table.model_class }})
+{% endfor %}
+
+        # ---- Django built-in models commonly hit by application code ----
+        # auth.Permission/Group: any permission-check helper (e.g.
+        # ``Permission.objects.get(codename=...)``) falls through to a real
+        # ``sqlite3.connect`` without these, tripping CrossHair's auditwall
+        # with a ``SideEffectDetected``.
+        try:
+            from django.contrib.auth.models import Permission as _DjangoPermission
+            _DjangoPermission.objects = MockManager(_DjangoPermission)
+            _DjangoPermission.save = mock_save
+            _DjangoPermission.delete = mock_delete
+            _DjangoPermission.refresh_from_db = mock_refresh_from_db
+        except ImportError:
+            pass
+        try:
+            from django.contrib.auth.models import Group as _DjangoGroup
+            _DjangoGroup.objects = MockManager(_DjangoGroup)
+            _DjangoGroup.save = mock_save
+            _DjangoGroup.delete = mock_delete
+            _DjangoGroup.refresh_from_db = mock_refresh_from_db
+        except ImportError:
+            pass
+
+        # ---- Django staticfiles storage classes (Pattern 5g) ----
+        # StaticFilesStorage / ManifestStaticFilesStorage have a
+        # keyword-only-before-variadic-positional ``__init__`` MRO that crashes
+        # ``inspect.Signature`` (``ValueError: wrong parameter order``) during
+        # ``intersect_signatures`` in ``proxy_for_class``. Any code that
+        # contracts a method on a ``ManifestStaticFilesStorage`` subclass
+        # hits this. Register a ``__new__`` bypass factory so ``proxy_for_type``
+        # short-circuits before ``proxy_for_class`` introspects the signature.
+        try:
+            from crosshair import register_type as _register_type
+            from django.contrib.staticfiles.storage import (
+                StaticFilesStorage as _StaticFilesStorage,
+                ManifestStaticFilesStorage as _ManifestStaticFilesStorage,
+            )
+
+            def _make_storage_via_new(_cls):
+                def _factory(_f, _c=_cls):
+                    inst = _c.__new__(_c)
+                    inst.__dict__.setdefault('hashed_files', {})
+                    inst.__dict__.setdefault('manifest_strict', False)
+                    inst.__dict__.setdefault('manifest_version', '1.1')
+                    inst.__dict__.setdefault('base_url', '/')
+                    inst.__dict__.setdefault('location', '')
+                    return inst
+                return _factory
+
+            for _storage_cls in (_StaticFilesStorage, _ManifestStaticFilesStorage):
+                try:
+                    _register_type(_storage_cls, _make_storage_via_new(_storage_cls))
+                except Exception:
+                    pass  # Duplicate or unsupported
+        except Exception:
+            pass
+
         print("CrossHair Django ORM stubs installed ({{ tables|length }} models)")
 
     except ImportError as e:
         print(f"Failed to install stubs: {e}")
 
+
+# CrossHair's `--extra_plugin` loader runs this file via
+# `exec(Path(plugin).read_text())` inside `crosshair.main.unwalled_main`.
+# Class and function definitions therefore land in that function's *locals*,
+# not module globals. When `install_stubs()` (or any other function defined
+# above) is invoked, name lookups go through the function's own globals
+# (crosshair.main) — sibling definitions are invisible there, producing a
+# silent `NameError: name 'MockManager' is not defined` that the
+# try/except in install_stubs swallows. Copy every local definition into
+# globals before calling install_stubs so the call resolves correctly.
+_local_names = dict(locals())
+globals().update({k: v for k, v in _local_names.items() if not k.startswith('__')})
 
 install_stubs()

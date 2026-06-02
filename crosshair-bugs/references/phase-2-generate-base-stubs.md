@@ -1,6 +1,6 @@
 # Phase 2: Generate Base Stubs
 
-Spawn as: `Task(subagent_type="general-purpose")`
+Spawn as: `Agent(subagent_type="general-purpose")`
 
 Create base CrossHair stub file.
 

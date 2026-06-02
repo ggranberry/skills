@@ -205,4 +205,13 @@ def install_stubs() -> None:
         print(f"Failed to install stubs: {e}")
 
 
+# CrossHair's `--extra_plugin` loader runs this file via
+# `exec(Path(plugin).read_text())` inside `crosshair.main.unwalled_main`.
+# Class and function definitions land in that function's *locals*, not
+# module globals — so `install_stubs()` can't find sibling helpers through
+# its own globals (silent NameError swallowed by the try/except). Copy
+# every local definition into globals before invoking install_stubs.
+_local_names = dict(locals())
+globals().update({k: v for k, v in _local_names.items() if not k.startswith('__')})
+
 install_stubs()

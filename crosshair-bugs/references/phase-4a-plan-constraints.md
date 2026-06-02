@@ -1,6 +1,6 @@
 # Phase 4a: Plan Constraint Application
 
-Spawn as: `Task(subagent_type="Plan")`
+Spawn as: `Agent(subagent_type="Plan")`
 
 Plan how to apply database constraints to CrossHair symbolic variables.
 
@@ -17,6 +17,8 @@ For each constraint type, plan the translation:
 | check: "age >= 0" | `space.add(result.age >= 0)` |
 | enum: ["a","b"] | `space.add(z3.Or(result.x == 'a', result.x == 'b'))` |
 | String(N) | `space.add(len(result.field) <= N)` |
+
+**Critical:** every `space.add(...)` MUST be wrapped in `try: ... except BaseException: pass`. `space.add` can raise `crosshair.util.CrossHairInternal` (e.g. "Attempted to assert a concrete boolean") which extends `ControlFlowException` → `BaseException`, **not** `Exception`. A plain `except Exception:` lets the error propagate and kills the entire analysis run with a misleading traceback. This was a silent stub-failure mode on a real project (wger, 2026-05).
 
 ## Output
 

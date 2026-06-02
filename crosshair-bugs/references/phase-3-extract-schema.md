@@ -1,6 +1,6 @@
 # Phase 3: Extract Schema Constraints
 
-Spawn as: `Task(subagent_type="Explore")`
+Spawn as: `Agent(subagent_type="Explore")`
 
 Extract database constraints from model files.
 

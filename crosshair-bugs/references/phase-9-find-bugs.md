@@ -54,6 +54,32 @@ Each call gets its own task ID. **Wait for every task notification (completed or
 
 **Resuming:** Re-run the generate script — it automatically skips files whose output already exists. Delete specific output files to force a re-check.
 
+## Step 2.5: Verify the smart stubs actually loaded
+
+Before parsing counterexamples, confirm `_crosshair_stubs.py` was actually exec'd by CrossHair. This catches a silent failure mode where the stub plugin didn't load and CrossHair has been running with only base Django bootstrap — every "clean" file is misleading and every counterexample on a model-method is artificially inflated noise.
+
+```bash
+total=$(ls .claude/artifacts/crosshair-bugs/crosshair/crosshair-output-*.txt | wc -l)
+loaded=$(grep -l "CrossHair Django ORM stubs installed" \
+  .claude/artifacts/crosshair-bugs/crosshair/crosshair-output-*.txt 2>/dev/null | wc -l)
+echo "Stubs loaded in $loaded / $total files"
+```
+
+Expected: `loaded` should equal `total` (or very close — a handful of files may abort before the install marker on a stub-internal crash).
+
+If `loaded` is **0 or near-zero**, the stubs are not loading. Most common cause: **the run script passed `--extra_plugin` twice** (e.g. `--extra_plugin a.py --extra_plugin b.py`). CrossHair's argparse uses `nargs="+"`, which silently overwrites — only the second value sticks. Inspect `run_crosshair.sh`: every line must have a single `--extra_plugin` followed by multiple values:
+
+```bash
+# WRONG (silently drops _crosshair_stubs.py):
+crosshair check foo.py --extra_plugin _crosshair_stubs.py --extra_plugin crosshair_django_setup.py ...
+# RIGHT:
+crosshair check foo.py --extra_plugin _crosshair_stubs.py crosshair_django_setup.py ...
+```
+
+The current `generate_crosshair_run.py` emits the correct form. If the run script you're staring at has the wrong form, regenerate it.
+
+A second cause: the stub file's `install_stubs()` raised `NameError: name 'MockManager' is not defined`. CrossHair's `--extra_plugin` does `exec(Path(plugin).read_text())` inside `unwalled_main` — class/function definitions land in that function's *locals*, not module globals, so functions defined in the file can't see each other. The generated stub template includes a `globals().update(locals())` shim before `install_stubs()` for exactly this reason. If you're staring at a hand-written or older stub file, check that the shim is there.
+
 ## Step 3: Parse Counterexamples
 
 Read all `.claude/artifacts/crosshair-bugs/crosshair/crosshair-output-*.txt` files. For each counterexample found, extract:

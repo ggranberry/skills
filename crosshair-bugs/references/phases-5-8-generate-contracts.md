@@ -106,7 +106,7 @@ Spawn one apply agent per unique source file — all in parallel in a single mes
 
 2. **Group by source file:** Collect all pending assignments and group them by `file`. Each group becomes one apply-agent's work.
 
-3. **Spawn all apply agents in parallel** (single message, one Task per unique source file). Pass the agent the list of plan file paths for its source file.
+3. **Spawn all apply agents in parallel** (single message, one Agent per unique source file). Pass the agent the list of plan file paths for its source file.
 
 4. Each agent appends `## Applied` to its plan files after successfully applying them.
 

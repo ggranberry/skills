@@ -100,6 +100,10 @@ from django.db.models.base import Model as _Model
 # Map Django Field internal types to a Python type CrossHair can proxy.
 # Only fields that map here get symbolic values; relations / generated /
 # JSON / file-blob fields fall through to a sane concrete default.
+import datetime as _dt
+import decimal as _dec
+import uuid as _uuid_mod
+
 _DJANGO_FIELD_TO_PY: dict = {
     "CharField": str, "TextField": str, "SlugField": str,
     "EmailField": str, "URLField": str,
@@ -112,6 +116,16 @@ _DJANGO_FIELD_TO_PY: dict = {
     "BooleanField": bool, "NullBooleanField": bool,
     "FloatField": float,
     "BinaryField": bytes,
+    # Date/time, UUID, and Decimal — without these, symbolic access to e.g.
+    # ``flip.created`` returns None and any ``.replace(...)`` / ``.isoformat()``
+    # call raises AttributeError. That's a stub gap, not a real bug — Django
+    # enforces NOT NULL on these fields at the DB level.
+    "DateTimeField": _dt.datetime,
+    "DateField": _dt.date,
+    "TimeField": _dt.time,
+    "DurationField": _dt.timedelta,
+    "UUIDField": _uuid_mod.UUID,
+    "DecimalField": _dec.Decimal,
 }
 
 # Thread-local recursion guard so FK descriptor proxies don't blow the
@@ -155,15 +169,40 @@ def _patched_model_init(self, *args, **kwargs):
                 d = f.default
                 return d() if callable(d) else d
             # 2. Try a symbolic value if we're inside CrossHair tracing
-            #    AND the field maps to a known Python type.
+            #    AND the field maps to a known Python type. Wrap in Optional
+            #    when the column allows NULL, so CrossHair explores both the
+            #    present and absent paths — that's where most None-handling
+            #    bugs live.
             if space is not None and proxy_for_type is not None:
-                py_type = _DJANGO_FIELD_TO_PY.get(type(f).__name__)
+                field_cls_name = type(f).__name__
+                py_type = _DJANGO_FIELD_TO_PY.get(field_cls_name)
                 if py_type is not None:
+                    if getattr(f, "null", False):
+                        from typing import Optional as _Opt
+                        py_type = _Opt[py_type]
                     varname = f"{cls_name}_{f.attname}"
                     try:
-                        return proxy_for_type(py_type, varname)
+                        result = proxy_for_type(py_type, varname)
                     except BaseException:  # noqa: BLE001
                         pass
+                    else:
+                        # Constrain DateTimeField proxies to be tz-aware when
+                        # the project uses USE_TZ=True (Django's modern default).
+                        # Production datetimes are always aware; without this,
+                        # CrossHair generates naive datetimes and comparisons
+                        # with aware constants raise TypeError — findings that
+                        # can't occur in production. We pin tzinfo to a concrete
+                        # UTC so year/month/day/etc remain symbolic while
+                        # comparisons against aware constants are well-typed.
+                        if result is not None and field_cls_name == "DateTimeField":
+                            try:
+                                from django.conf import settings as _s
+                                if getattr(_s, "USE_TZ", True):
+                                    import datetime as _dt
+                                    result = result.replace(tzinfo=_dt.timezone.utc)
+                            except BaseException:  # noqa: BLE001
+                                pass
+                        return result
             # 3. Mirror Django's runtime behavior for unset fields:
             #    "" for empty-strings-allowed CharField/TextField/etc.
             #    that aren't nullable; None otherwise.
@@ -182,8 +221,11 @@ def _patched_model_init(self, *args, **kwargs):
         # forward descriptor reads ``_state.fields_cache[field.cache_name]``
         # before falling through to a DB query — putting a constructed
         # related instance there short-circuits the DB path entirely.
-        # Only at depth 0 to avoid infinite recursion on cyclic schemas.
-        if depth == 0:
+        # Populate at depth ≤ 1 so two-hop accesses like ``check.project.owner``
+        # work, but deeper nesting falls back to an unpatched default-instance
+        # to avoid stack-blowing on cyclic schemas. Depth 2+ is rare in
+        # practice — most contracted code navigates at most two FKs deep.
+        if depth <= 1:
             for f in opts.fields:
                 if not (getattr(f, "is_relation", False)
                         and getattr(f, "many_to_one", False)):
@@ -220,7 +262,16 @@ _Model.__init__ = _patched_model_init
 #
 # uuid.UUID.__init__ does ``if int >> 128: raise ValueError(...)`` on the
 # symbolic int CrossHair passes, tripping the same "Numeric operation on
-# symbolic while not tracing" wall. Bypass with a plain __dict__ assign.
+# symbolic while not tracing" wall.
+#
+# Two related issues:
+# 1. UUID uses ``__slots__`` (not __dict__) on Python 3.12+, so the obvious
+#    ``self.__dict__["int"] = int`` fails with AttributeError. Use
+#    object.__setattr__ on the slot members instead — Python's own uuid.py
+#    does the same.
+# 2. UUID.__getstate__ does ``if self.is_safe != SafeUUID.unknown:`` — a
+#    symbolic-vs-enum comparison that re-trips the wall during CrossHair's
+#    argument deepcopy. UUIDs are immutable, so __deepcopy__ can return self.
 import uuid as _uuid
 
 
@@ -230,11 +281,16 @@ def _patched_uuid_init(
 ):
     if int is None:
         int = 0
-    self.__dict__["int"] = int
-    self.__dict__["is_safe"] = is_safe
+    object.__setattr__(self, "int", int)
+    object.__setattr__(self, "is_safe", is_safe)
+
+
+def _patched_uuid_deepcopy(self, memo):
+    return self
 
 
 _uuid.UUID.__init__ = _patched_uuid_init
+_uuid.UUID.__deepcopy__ = _patched_uuid_deepcopy
 
 
 # ---------------------------------------------------------------------------
